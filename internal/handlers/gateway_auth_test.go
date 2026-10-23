@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,103 @@ import (
 	"github.com/mescon/muximux/v3/internal/auth"
 	"github.com/mescon/muximux/v3/internal/config"
 )
+
+// Exercise the real middleware, not a hand-written user context: only its
+// trusted-hop/header validation may authenticate a forward-auth gateway hit.
+func TestGatewayAuth_ForwardAuthIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, header, username, groups, minRole, allowedGroup, remote string
+		cookie                                                        bool
+		want                                                          int
+	}{
+		{name: "default header", username: "alice", want: 200},
+		{name: "custom header", header: "Cf-Access-Authenticated-User-Email", username: "alice@example.test", want: 200},
+		{name: "admin", username: "owner", groups: "admin", minRole: "admin", want: 200},
+		{name: "role denied", username: "friend", minRole: "admin", want: 403},
+		{name: "group accepted", username: "friend", groups: "Friends", allowedGroup: "friends", want: 200},
+		{name: "group denied", username: "friend", groups: "other", allowedGroup: "friends", want: 403},
+		{name: "missing identity", want: 302},
+		{name: "stale cookie cannot replace identity", cookie: true, minRole: "admin", want: 302},
+		{name: "identity overrides stale admin cookie", username: "friend", cookie: true, minRole: "admin", want: 403},
+		{name: "nonloopback", username: "owner", groups: "admin", remote: "10.0.0.2:1234", want: 403},
+		{name: "untrusted loopback", username: "owner", groups: "admin", remote: "[::1]:1234", want: 302},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			site := config.GatewaySite{Domain: "app.example.test", BackendURL: "http://127.0.0.1:9999", RequireAuth: true, MinRole: tc.minRole}
+			if tc.allowedGroup != "" {
+				site.AllowedGroups = []string{tc.allowedGroup}
+			}
+			h, store := newTestGatewayAuthHandler(t, []config.GatewaySite{site})
+			h.cfg.Auth.Method = "forward_auth"
+			cfg := &auth.AuthConfig{Method: auth.AuthMethodForwardAuth, TrustedProxies: []string{"127.0.0.1/32", "10.0.0.2/32"}, BypassRules: []auth.BypassRule{{Path: "/api/auth/forward"}}}
+			cfg.Headers.User = tc.header
+			middleware := auth.NewMiddleware(cfg, store, auth.NewUserStore())
+			req := httptest.NewRequest(http.MethodGet, "/api/auth/forward", nil)
+			req.RemoteAddr = tc.remote
+			if req.RemoteAddr == "" {
+				req.RemoteAddr = "127.0.0.1:1234"
+			}
+			req.Header.Set("X-Forwarded-Host", site.Domain)
+			header := tc.header
+			if header == "" {
+				header = "Remote-User"
+			}
+			req.Header.Set(header, tc.username)
+			req.Header.Set("Remote-Groups", tc.groups)
+			if tc.cookie {
+				session, err := store.Create("old", "old-admin", auth.RoleAdmin)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.AddCookie(&http.Cookie{Name: "muximux_session", Value: session.ID})
+			}
+			before := store.Count()
+			w := httptest.NewRecorder()
+			middleware.RequireAuth(http.HandlerFunc(h.Forward)).ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d, want %d; body=%s", w.Code, tc.want, w.Body.String())
+			}
+			if w.Header().Get("Set-Cookie") != "" || store.Count() != before {
+				t.Fatal("forward auth must not create a persistent session")
+			}
+			if tc.want == 200 && w.Header().Get("X-Muximux-User") != tc.username {
+				t.Fatalf("identity=%q, want %q", w.Header().Get("X-Muximux-User"), tc.username)
+			}
+		})
+	}
+}
+
+func TestGatewayAuth_BuiltinIgnoresForwardIdentity(t *testing.T) {
+	h, _ := newTestGatewayAuthHandler(t, []config.GatewaySite{{Domain: "app.example.test", RequireAuth: true}})
+	h.cfg.Auth.Method = "builtin"
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/forward", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-Host", "app.example.test")
+	req.Header.Set("Remote-User", "spoofed")
+	req = req.WithContext(context.WithValue(req.Context(), auth.ContextKeyUser, &auth.User{Username: "context-admin", Role: auth.RoleAdmin}))
+	w := httptest.NewRecorder()
+	h.Forward(w, req)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status=%d, want302", w.Code)
+	}
+}
+
+func TestGatewayAuth_ForwardAuthRejectsPreviousNoneSnapshot(t *testing.T) {
+	// Simulate an in-flight request authenticated before a runtime switch
+	// from none to forward_auth. Its virtual admin must not become a trusted
+	// forward-auth identity when the handler sees the newer configuration.
+	h, store := newTestGatewayAuthHandler(t, []config.GatewaySite{{Domain: "app.example.test", RequireAuth: true, MinRole: "admin"}})
+	h.cfg.Auth.Method = "forward_auth"
+	middleware := auth.NewMiddleware(&auth.AuthConfig{Method: auth.AuthMethodNone}, store, auth.NewUserStore())
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/forward", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-Host", "app.example.test")
+	w := httptest.NewRecorder()
+	middleware.RequireAuth(http.HandlerFunc(h.Forward)).ServeHTTP(w, req)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status=%d, want302; virtual admin must not authenticate forward auth", w.Code)
+	}
+}
 
 // newTestGatewayAuthHandler wires the handler with a fresh session
 // store and the given gateway sites. dashboardURL defaults to the

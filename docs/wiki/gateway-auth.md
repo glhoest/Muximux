@@ -137,7 +137,17 @@ A couple of defence-in-depth measures sit on the gate endpoint:
 |---|---|
 | `auth.method: builtin` | Native users; session check is straightforward. |
 | `auth.method: oidc` | Sessions backed by OIDC tokens; gate uses the same session check. Operators get OIDC users surfaced to gated apps via `X-Muximux-User`. |
-| `auth.method: forwardauth` (Authelia / Authentik) | Muximux trusts an upstream `Remote-User` header to create a session, then the gate reads that session. Daisy-chained forward-auth works but adds a network hop; consider whether the upstream is already gating the same set of apps. |
+| `auth.method: forward_auth` (Authelia / Authentik / Cloudflare Access) | The gate uses the user resolved by Muximux's trusted-proxy middleware on each request (`Remote-User` by default, or the configured `auth.headers.user`). It enforces the same role and group checks without creating a Muximux session. A cookie alone cannot authenticate a forward-auth request. |
+
+In forward-auth mode, **every gated hostname must pass through the trusted
+authentication proxy**. Block direct access to the gateway listener, and strip
+or replace client-supplied identity and group headers at that boundary. Caddy
+forwards those headers over its internal loopback hop, which must be included
+in `auth.trusted_proxies`; trusting that hop does not authenticate public
+traffic by itself. Logout and identity revocation are controlled by the
+upstream provider, and changed roles/groups are evaluated on the next request.
+As with other gateway modes, an established WebSocket is not reauthenticated
+until it reconnects.
 
 ---
 

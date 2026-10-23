@@ -15,7 +15,7 @@ import (
 // GatewayAuthHandler implements the receive side of Caddy's
 // forward_auth directive: every request to a require_auth=true
 // gateway site arrives here over the loopback, this handler decides
-// whether the upstream Muximux session permits the request.
+// whether the Muximux session or trusted forward-auth identity permits it.
 //
 // The handler must be registered on the INTERNAL mux only (the one
 // bound to 127.0.0.1:<internal-port>). Exposing it on the external
@@ -124,8 +124,27 @@ func (h *GatewayAuthHandler) Forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := h.sessionStore.GetFromRequest(r)
-	if session == nil || session.IsExpired() {
+	// Forward auth is deliberately stateless: the middleware verifies the
+	// trusted proxy and resolves its identity on every request. Never fall
+	// back to a cookie in this mode, or a revoked upstream identity could
+	// retain access through an older Muximux session. The temporary value
+	// below is only input to the shared permission checks; it is not stored
+	// and no session cookie is issued.
+	h.configMu.RLock()
+	forwardAuth := h.cfg.Auth.Method == string(auth.AuthMethodForwardAuth)
+	h.configMu.RUnlock()
+	var session *auth.Session
+	if forwardAuth {
+		if user := auth.GetForwardAuthUserFromContext(r.Context()); user != nil {
+			session = &auth.Session{
+				UserID: user.ID, Username: user.Username, Role: user.Role,
+				Data: map[string]interface{}{"groups": user.Groups},
+			}
+		}
+	} else {
+		session = h.sessionStore.GetFromRequest(r)
+	}
+	if session == nil || (!forwardAuth && session.IsExpired()) {
 		// No session: redirect to login with a validated next= param
 		// pointing back at the original gated URL. Pass the matched
 		// site (not the raw header) so the rebuilt URL uses the

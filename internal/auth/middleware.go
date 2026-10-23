@@ -18,6 +18,17 @@ import (
 // ContextKey is a type for context keys
 type ContextKey string
 
+// A distinct key records the provenance of a forward-auth identity. A generic
+// user may instead come from a cookie or auth:none's virtual administrator.
+type forwardAuthUserContextKey struct{}
+
+// GetForwardAuthUserFromContext returns only an identity that this request's
+// middleware snapshot resolved from trusted forward-auth headers.
+func GetForwardAuthUserFromContext(ctx context.Context) *User {
+	user, _ := ctx.Value(forwardAuthUserContextKey{}).(*User)
+	return user
+}
+
 const (
 	// ContextKeyUser is the context key for the authenticated user
 	ContextKeyUser ContextKey = "user"
@@ -215,6 +226,9 @@ func (m *Middleware) RequireAuth(next http.Handler) http.Handler {
 			user, session := m.authenticateRequest(r, snap)
 			if user != nil {
 				ctx := context.WithValue(r.Context(), ContextKeyUser, user)
+				if snap.config.Method == AuthMethodForwardAuth {
+					ctx = context.WithValue(ctx, forwardAuthUserContextKey{}, user)
+				}
 				ctx = logging.SetUser(ctx, user.Username)
 				if session != nil {
 					ctx = context.WithValue(ctx, ContextKeySession, session)
@@ -237,6 +251,9 @@ func (m *Middleware) RequireAuth(next http.Handler) http.Handler {
 		logging.From(r.Context()).Debug("Authenticated request", "source", "auth", "user", user.Username, "path", r.URL.Path)
 
 		ctx := context.WithValue(r.Context(), ContextKeyUser, user)
+		if snap.config.Method == AuthMethodForwardAuth {
+			ctx = context.WithValue(ctx, forwardAuthUserContextKey{}, user)
+		}
 		ctx = logging.SetUser(ctx, user.Username)
 		if session != nil {
 			ctx = context.WithValue(ctx, ContextKeySession, session)
